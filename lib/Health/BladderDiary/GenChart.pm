@@ -12,58 +12,123 @@ use warnings;
 use Exporter qw(import);
 our @EXPORT_OK = qw(gen_bladder_chart_from_entries);
 
+use Data::Clone;
 use Hash::Subset qw(hash_subset);
 use Health::BladderDiary::GenTable;
 
 our %SPEC;
 
-my $gbdt_meta = $Health::BladderDiary::GenTable::SPEC{gen_bladder_diary_table_from_entries};
+my $meta = clone $Health::BladderDiary::GenTable::SPEC{gen_bladder_diary_table_from_entries};
+$meta->{args}{date}{req} = 1;
 
 $SPEC{gen_bladder_diary_chart_from_entries} = {
     v => 1.1,
     summary => 'Create bladder chart from bladder diary entries',
     args => {
-        %{ $gdbt_meta->{args} },
-        date => {
-            schema => 'date*',
-            req => 1,
-            'x.perl.coerce_to' => 'DateTime',
-        },
+        %{ $meta->{args} },
     },
 };
 sub gen_bladder_diary_chart_from_entries {
     require Chart::Gnuplot;
     require File::Temp;
     require List::Util;
-    require Math::Round;
+    #require Math::Round;
 
     my %args = @_;
+    my $date = $args{date};
 
     my $res = Health::BladderDiary::GenTable::gen_bladder_diary_table_from_entries(
-        hash_subset(\%args, $gdbt_meta->{args}),
-        _raw => 1,
+        hash_subset(\%args, $meta->{args}),
     );
-    use DD; dd $res;
+    #use DD; dd $res;
 
     my ($tempfh, $tempfilename) = File::Temp::tempfile();
     $tempfilename .= ".png";
+
+    my (@x_urate, @y_urate);
+    my $max_urate_scale;
+  SET_RATE_DATASET: {
+        my $prev_hour;
+        my $max_urate;
+        my $datecur = $date->clone;
+        for my $entry (@{ $res->[2] }) {
+            last if !keys %$entry; # blank line marks the end of entries
+            my $rate = $entry->{'urate (ml/h)'};
+            next unless defined $rate;
+            my $time = $entry->{'urin/defec time'};
+            my ($hour, $minute) = $time =~ /(\d+)\.(\d+)/;
+            if (defined $prev_hour && $prev_hour > $hour) {
+                $datecur->add(days => 1);
+            }
+            push @x_urate, sprintf("%sT%02d:%02d", $datecur->ymd, $hour, $minute);
+            push @y_urate, $rate;
+            $max_urate = $rate if !defined $max_urate || $max_urate < $rate;
+            $prev_hour = $hour;
+        }
+        $max_urate_scale = 250;
+        $max_urate_scale+= 250 while $max_urate_scale < $max_urate;
+    }
+
+    my (@x_ivol, @y_ivol);
+    my $max_ivol_scale;
+  SET_INTAKE_DATASET: {
+        my $prev_hour;
+        my $max_ivol;
+        my $datecur = $date->clone;
+        for my $entry (@{ $res->[2] }) {
+            last if !keys %$entry; # blank line marks the end of entries
+            my $vol = $entry->{'ivol (ml)'};
+            next unless defined $vol;
+            my $time = $entry->{'itime'};
+            my ($hour, $minute) = $time =~ /(\d+)\.(\d+)/;
+            if (defined $prev_hour && $prev_hour > $hour) {
+                $datecur->add(days => 1);
+            }
+            push @x_ivol, sprintf("%sT%02d:%02d", $datecur->ymd, $hour, $minute);
+            push @y_ivol, $vol;
+            $max_ivol = $vol if !defined $max_ivol || $max_ivol < $vol;
+            $prev_hour = $hour;
+        }
+        $max_ivol_scale = 250;
+        $max_ivol_scale+= 250 while $max_ivol_scale < $max_ivol;
+    }
     my $chart = Chart::Gnuplot->new(
         output   => $tempfilename,
-        #title    => 'Urine output on '.($args{date}->ymd),
+        title    => 'Urine output on '.($date->ymd),
         xlabel   => 'time',
         ylabel   => 'ml/h',
+        y2label  => 'ml',
         timeaxis => 'x',
-        timefmt  => '%Y-%m-%dT%H:%M',
+        xtics    => {labelfmt=>'%H:%M'},
+
+        #yrange   => [0, $max_urate_scale],
+        #y2range  => [0, $max_ivol_scale],  # XXX why won't take effect?
+        yrange   => [0, List::Util::max($max_urate_scale, $max_ivol_scale)],
+        y2range  => [0, List::Util::max($max_urate_scale, $max_ivol_scale)],
     );
-    my (@x, @y);
-    #
-    my $dataset = Chart::Gnuplot::DataSet->new(
-        xdata => \@x,
-        ydata => \@y,
+    my $dataset_urate = Chart::Gnuplot::DataSet->new(
+        xdata => \@x_urate,
+        ydata => \@y_urate,
+        timefmt => '%Y-%m-%dT%H:%M',
         title => 'Urine output (ml/h)',
         color => 'red',
         style => 'linespoints',
     );
+    my $dataset_ivol = Chart::Gnuplot::DataSet->new(
+        xdata => \@x_ivol,
+        ydata => \@y_ivol,
+        timefmt => '%Y-%m-%dT%H:%M',
+        title => 'Intake volume (ml)',
+        color => 'blue',
+        style => 'points',
+    );
+
+    $chart->plot2d($dataset_urate, $dataset_ivol);
+
+    require Browser::Open;
+    Browser::Open::open_browser("file:$tempfilename");
+
+    [200];
 }
 
 1;
